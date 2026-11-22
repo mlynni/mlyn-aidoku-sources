@@ -1,7 +1,7 @@
 # Mihon Source Reference: MangaFire
 
 - **Mihon Path:** `src/all/mangafire`
-- **Mihon Version Code:** `38`
+- **Mihon Version Code:** `39`
 - **Aidoku Suggested ID:** `multi.mangafire`
 - **Base URL:** https://mangafire.to
 - **Languages (7):** en, es, es-419, fr, ja, pt, pt-BR

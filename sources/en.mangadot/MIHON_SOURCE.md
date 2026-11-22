@@ -1,7 +1,7 @@
 # Mihon Source Reference: MangaDot
 
 - **Mihon Path:** `src/all/mangadotnet`
-- **Mihon Version Code:** `30`
+- **Mihon Version Code:** `31`
 - **Aidoku Suggested ID:** `multi.mangadotnet`
 - **Base URL:** https://mangadot.net
 - **Languages (1):** en
