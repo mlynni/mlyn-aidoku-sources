@@ -1,7 +1,7 @@
 # Mihon Source Reference: Atsumaru
 
 - **Mihon Path:** `src/en/atsumaru`
-- **Mihon Version Code:** `27`
+- **Mihon Version Code:** `28`
 - **Aidoku Suggested ID:** `en.atsumaru`
 - **Base URL:** https://atsu.moe
 - **Languages (1):** en
@@ -14,6 +14,7 @@
 - `src/eu/kanade/tachiyomi/extension/en/atsumaru/Filters.kt`
 
 ## Endpoints & URLs
+- `$baseUrl/api/android/download`
 - `$baseUrl/api/explore/availableFilters`
 - `$baseUrl/api/home2/$path`
 - `$baseUrl/api/manga/allChapters`

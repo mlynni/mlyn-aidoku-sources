@@ -20,7 +20,7 @@
 			"iconFile": "en.atsumaru-v12.png",
 			"status": "ready",
 			"autoSync": true,
-			"lastMihonCommit": "92906c0382547f30a03b3176f2f2429be6b54dce",
+			"lastMihonCommit": "6650f5167dbda2b05ce5c7c1a30156d7c2caa3d2",
 			"lastAidokuCommit": "1d8567666735721cc8a0f632ff4191c78e3e6079"
 		},
 		{
@@ -136,7 +136,7 @@
 			"packageFile": "multi.mangafire-v9.aix",
 			"iconFile": "multi.mangafire-v9.png",
 			"status": "ready",
-			"lastMihonCommit": "92906c0382547f30a03b3176f2f2429be6b54dce",
+			"lastMihonCommit": "622a492bf84691825f54e40df215bd5b53dd2e77",
 			"lastAidokuCommit": "4f8922e1c939285ce6687e4af225d22d0deec093",
 			"autoSync": true
 		},
