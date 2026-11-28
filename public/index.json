@@ -98,9 +98,9 @@
 		{
 			"id": "en.mangago",
 			"name": "Mangago",
-			"version": 4,
-			"iconURL": "icons/en.mangago-v4.png",
-			"downloadURL": "sources/en.mangago-v4.aix",
+			"version": 5,
+			"iconURL": "icons/en.mangago-v5.png",
+			"downloadURL": "sources/en.mangago-v5.aix",
 			"languages": [
 				"en"
 			],
