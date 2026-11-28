@@ -766,7 +766,8 @@ async function main() {
 	const includeAll = args.includes("--all");
 	const force = args.includes("--force");
 	const idIdx = args.indexOf("--id");
-	const targetId = idIdx !== -1 ? args[idIdx + 1]?.trim() || null : null;
+	const rawTargetId = idIdx !== -1 ? args[idIdx + 1]?.trim() || "" : "";
+	const targetId = rawTargetId.replace(/^id\s*:\s*/i, "").trim() || null;
 
 	if (force && !targetId) {
 		throw new Error("--force requires --id <extension-id> to avoid burning API quota on all extensions.");
@@ -777,16 +778,27 @@ async function main() {
 	}
 
 	const registry = readJson(EXTENSIONS_FILE);
-	const watchedSources = (registry.sources || []).filter((entry) => {
-		if (targetId) {
-			return entry.id.toLowerCase() === targetId.toLowerCase();
-		}
-		if (includeAll || initCommits) return true;
-		return entry.autoSync === true;
-	});
+	const allSources = registry.sources || [];
+	let watchedSources;
+	if (targetId) {
+		const needle = targetId.toLowerCase();
+		const exact = allSources.filter((entry) => entry.id.toLowerCase() === needle);
+		watchedSources =
+			exact.length > 0
+				? exact
+				: allSources.filter(
+						(entry) =>
+							(entry.name || "").toLowerCase() === needle ||
+							entry.id.split(".").slice(1).join(".").toLowerCase() === needle
+					);
+	} else {
+		watchedSources = allSources.filter((entry) =>
+			includeAll || initCommits ? true : entry.autoSync === true
+		);
+	}
 
 	if (targetId && watchedSources.length === 0) {
-		throw new Error(`No extension found matching --id "${targetId}"`);
+		throw new Error(`No extension found matching --id "${rawTargetId}"`);
 	}
 
 	console.log(
