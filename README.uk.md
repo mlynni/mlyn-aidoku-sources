@@ -25,7 +25,7 @@ https://raw.githubusercontent.com/mlynni/mlyn-aidoku-sources/gh-pages/index.min.
 | Джерело | ID | Версія | Мови | Мін. Aidoku | Базовий URL | Примітки |
 |---|---|---:|---|---:|---|---|
 | Atsumaru | `en.atsumaru` | `v12` | `en` | `0.7.1` | https://atsu.moe | Пряме JSON API |
-| Comix | `en.comix` | `v36` | `en` | `0.8.4` | https://comix.to | Переписано з Mihon v64: WebView SPA-харвестери, вибір дзеркал (`comix.to` / `comix.ws`), дескремблер |
+| Comix | `en.comix` | `v37` | `en` | `0.8.4` | https://comix.to | Портовано прямий підписаний API з Mihon (`SiteKey`/`ApicoreKey`, дешифрування `x-enc` v2, `altHosts`) з фолбеком на WebView SPA-харвестери та `waf_pass` |
 | Kagane | `multi.kagane` | `v26` | 15 мов | `0.7.1` | https://kagane.moe | Манхва та манґа |
 | MANGA Plus | `multi.mangaplus` | `v6` | 9 мов | `0.7.2` | https://mangaplus.shueisha.co.jp | Офіційні релізи Shueisha |
 | Mangaball | `multi.mangaball` | `v15` | 34 мови (incl. `uk`) | `0.7.1` | https://mangaball.com | Мульти-CDN фолбек постерів і `.512.jpg` |

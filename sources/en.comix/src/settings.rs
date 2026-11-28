@@ -21,6 +21,10 @@ const SHOW_TAGS_IN_GENRES_KEY: &str = "showTagsInGenres";
 const DEFAULT_TYPES_KEY: &str = "defaultTypes";
 const DEFAULT_DEMOGRAPHICS_KEY: &str = "defaultDemographics";
 const BLOCKED_GENRES_KEY: &str = "blockedGenres";
+const WAF_PASS_KEY: &str = "wafPass";
+const WAF_PASS_WS_KEY: &str = "wafPassWs";
+const SITE_KEY_CACHE_KEY: &str = "siteKeyCache";
+const SITE_KEY_CACHE_WS_KEY: &str = "siteKeyCacheWs";
 
 pub fn base_url() -> String {
 	defaults_get::<String>(MIRROR_KEY)
@@ -48,6 +52,56 @@ pub fn mark_verified(ok: bool) {
 		defaults_set(key, DefaultValue::String("logged_in".into()));
 	} else {
 		defaults_set(key, DefaultValue::Null);
+	}
+}
+
+pub fn waf_pass_for(url: &str) -> Option<String> {
+	let key = if url.contains("comix.ws") {
+		WAF_PASS_WS_KEY
+	} else {
+		WAF_PASS_KEY
+	};
+	defaults_get::<String>(key).filter(|s| !s.trim().is_empty())
+}
+
+pub fn set_waf_pass_for(url: &str, token: &str) {
+	let is_ws = url.contains("comix.ws");
+	let waf_key = if is_ws { WAF_PASS_WS_KEY } else { WAF_PASS_KEY };
+	let trimmed = token.trim();
+	if trimmed.is_empty() {
+		defaults_set(waf_key, DefaultValue::Null);
+		return;
+	}
+	if defaults_get::<String>(waf_key).as_deref() != Some(trimmed) {
+		defaults_set(waf_key, DefaultValue::String(trimmed.into()));
+	}
+	let verify_key = if is_ws { VERIFY_WS_KEY } else { VERIFY_KEY };
+	if defaults_get::<String>(verify_key)
+		.as_deref()
+		.is_none_or(str::is_empty)
+	{
+		defaults_set(verify_key, DefaultValue::String("logged_in".into()));
+	}
+}
+
+pub fn cached_site_key() -> Option<String> {
+	let key = if base_url().contains("comix.ws") {
+		SITE_KEY_CACHE_WS_KEY
+	} else {
+		SITE_KEY_CACHE_KEY
+	};
+	defaults_get::<String>(key).filter(|s| !s.trim().is_empty())
+}
+
+pub fn set_cached_site_key(val: Option<&str>) {
+	let key = if base_url().contains("comix.ws") {
+		SITE_KEY_CACHE_WS_KEY
+	} else {
+		SITE_KEY_CACHE_KEY
+	};
+	match val.map(str::trim).filter(|s| !s.is_empty()) {
+		Some(v) => defaults_set(key, DefaultValue::String(v.into())),
+		None => defaults_set(key, DefaultValue::Null),
 	}
 }
 

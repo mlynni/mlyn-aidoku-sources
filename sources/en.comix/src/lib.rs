@@ -5,7 +5,7 @@ use aidoku::{
 	ImageRequestProvider, ImageResponse, Link, LinkValue, Listing, ListingProvider, Manga,
 	MangaPageResult, MangaWithChapter, NotificationHandler, Page, PageContent, PageContext,
 	PageImageProcessor, Result, Source, WebLoginHandler,
-	alloc::{String, Vec, string::ToString, vec},
+	alloc::{String, Vec, format, string::ToString, vec},
 	helpers::uri::QueryParameters,
 	imports::{
 		canvas::ImageRef,
@@ -20,10 +20,11 @@ mod descrambler;
 mod helpers;
 mod models;
 mod settings;
+mod site_key;
 mod web;
 
 use models::*;
-use settings::{VERIFY_KEY, VERIFY_WS_KEY};
+use settings::{ALT_MIRROR, DEFAULT_MIRROR, VERIFY_KEY, VERIFY_WS_KEY};
 
 struct Comix;
 
@@ -127,6 +128,66 @@ fn extract_home_list(data: &InitialData, needle: &str) -> Vec<ComixManga> {
 	}
 }
 
+fn push_param(params: &mut Vec<(String, String)>, key: &str, val: &str) {
+	params.push((key.to_string(), val.to_string()));
+}
+
+fn fetch_manga_list_api(
+	base_url: &str,
+	api_params: &[(String, String)],
+) -> core::result::Result<MangaPageResult, web::ApiError> {
+	let res: ApiResponse<MangaItems> =
+		web::call_signed_api(base_url, "/manga", api_params, "/browse")?;
+	let entries = res
+		.result
+		.items
+		.into_iter()
+		.map(|m| m.into_manga(base_url, false))
+		.collect();
+	Ok(MangaPageResult {
+		entries,
+		has_next_page: res.result.meta.page < res.result.meta.last_page,
+	})
+}
+
+fn fetch_chapters_api(
+	base_url: &str,
+	hid: &str,
+	referer_path: &str,
+) -> core::result::Result<Vec<HarvestedChapter>, web::ApiError> {
+	let api_path = format!("/manga/{hid}/chapters");
+	let mut all: Vec<HarvestedChapter> = Vec::new();
+	let mut page = 1;
+	loop {
+		let params = vec![
+			("page".into(), page.to_string()),
+			("limit".into(), "100".into()),
+			("order[number]".into(), "desc".into()),
+			("v".into(), "0".into()),
+			("w".into(), "0".into()),
+		];
+		let res: ApiResponse<ChapterItems> =
+			web::call_signed_api(base_url, &api_path, &params, referer_path)?;
+		let last_page = res.result.meta.last_page;
+		if res.result.items.is_empty() {
+			break;
+		}
+		all.extend(res.result.items.into_iter().map(ApiChapter::into_harvested));
+		if page >= last_page {
+			break;
+		}
+		page += 1;
+	}
+	Ok(all)
+}
+
+fn extract_url_host(url: &str) -> Option<&str> {
+	let rest = url
+		.strip_prefix("https://")
+		.or_else(|| url.strip_prefix("http://"))?;
+	Some(rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
+
 fn browse_with_defaults(
 	sort: &str,
 	extra_types: Option<&str>,
@@ -134,20 +195,34 @@ fn browse_with_defaults(
 ) -> Result<MangaPageResult> {
 	let base_url = settings::base_url();
 	let mut qs = QueryParameters::new();
+	let mut api_params: Vec<(String, String)> = Vec::new();
 
 	qs.push("sort", Some(sort));
 	qs.push("page", Some(&page.to_string()));
+	let (sort_field, sort_dir) = sort.split_once(':').unwrap_or((sort, "desc"));
+	push_param(&mut api_params, &format!("order[{sort_field}]"), sort_dir);
+	push_param(&mut api_params, "page", &page.to_string());
+	push_param(&mut api_params, "limit", "28");
 
 	let rating = settings::content_rating();
 	let ratings = settings::content_ratings_up_to(&rating);
 	qs.push("content_rating", Some(&ratings.join(",")));
+	for r in ratings {
+		push_param(&mut api_params, "content_rating[]", r);
+	}
 
 	if let Some(types) = extra_types {
 		qs.push("types", Some(types));
+		for t in types.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+			push_param(&mut api_params, "types[]", t);
+		}
 	} else {
 		let types = settings::default_types();
 		if !types.is_empty() && types.len() < 4 {
 			qs.push("types", Some(&types.join(",")));
+			for t in types {
+				push_param(&mut api_params, "types[]", &t);
+			}
 		}
 	}
 
@@ -160,6 +235,13 @@ fn browse_with_defaults(
 	}
 	if !excluded_genres.is_empty() {
 		qs.push("genres_ex", Some(&excluded_genres.join(",")));
+		for ex in excluded_genres {
+			push_param(&mut api_params, "genres_ex[]", &ex);
+		}
+	}
+
+	if let Ok(page_res) = fetch_manga_list_api(&base_url, &api_params) {
+		return Ok(page_res);
 	}
 
 	let url = format!("{base_url}/browse?{qs}");
@@ -378,6 +460,15 @@ impl Source for Comix {
 			}
 		}
 
+		let mut api_params: Vec<(String, String)> = Vec::new();
+		if let Some(ref q) = query_text {
+			qs.push("q", Some(q));
+			push_param(&mut api_params, "keyword", q);
+		}
+		qs.push("page", Some(&page.to_string()));
+		push_param(&mut api_params, "page", &page.to_string());
+		push_param(&mut api_params, "limit", "28");
+
 		let sort_final = sort_param.unwrap_or_else(|| {
 			if query_text.is_some() {
 				"relevance:desc".into()
@@ -386,6 +477,10 @@ impl Source for Comix {
 			}
 		});
 		qs.push("sort", Some(&sort_final));
+		let (sort_field, sort_dir) = sort_final
+			.split_once(':')
+			.unwrap_or((&sort_final, "desc"));
+		push_param(&mut api_params, &format!("order[{sort_field}]"), sort_dir);
 
 		let rating_str = match content_rating_override.as_deref() {
 			Some(val) => val.to_string(),
@@ -393,10 +488,16 @@ impl Source for Comix {
 		};
 		let ratings = settings::content_ratings_up_to(&rating_str);
 		qs.push("content_rating", Some(&ratings.join(",")));
+		for r in ratings {
+			push_param(&mut api_params, "content_rating[]", r);
+		}
 
 		let types_to_apply = selected_types.unwrap_or_else(settings::default_types);
 		if !types_to_apply.is_empty() && types_to_apply.len() < 4 {
 			qs.push("types", Some(&types_to_apply.join(",")));
+			for t in types_to_apply {
+				push_param(&mut api_params, "types[]", &t);
+			}
 		}
 
 		if !demo_filter_seen {
@@ -408,6 +509,9 @@ impl Source for Comix {
 		}
 		if !demos_in.is_empty() {
 			qs.push("demos", Some(&demos_in.join(",")));
+			for d in demos_in {
+				push_param(&mut api_params, "demographics[]", &d);
+			}
 		}
 		for ex_d in excluded_demos {
 			if !genres_ex.contains(&ex_d) {
@@ -417,33 +521,57 @@ impl Source for Comix {
 
 		if !genres_in.is_empty() {
 			qs.push("genres_in", Some(&genres_in.join(",")));
+			for g in &genres_in {
+				push_param(&mut api_params, "genres_in[]", g);
+			}
 			if let Some(mode) = genres_mode {
 				qs.push("genres_mode", Some(&mode));
+				push_param(&mut api_params, "genres_mode", &mode);
 			}
 		}
 		if !genres_ex.is_empty() {
 			qs.push("genres_ex", Some(&genres_ex.join(",")));
+			for g in &genres_ex {
+				push_param(&mut api_params, "genres_ex[]", g);
+			}
 		}
 		if !statuses.is_empty() {
 			qs.push("statuses", Some(&statuses.join(",")));
+			for st in &statuses {
+				push_param(&mut api_params, "statuses[]", st);
+			}
 		}
 		if let Some(v) = min_chap {
 			qs.push("min_chap", Some(&v));
+			push_param(&mut api_params, "min_chap", &v);
 		}
 		if let Some(v) = max_chap {
 			qs.push("max_chap", Some(&v));
+			push_param(&mut api_params, "max_chap", &v);
 		}
 		if let Some(v) = year_from {
 			qs.push("year_from", Some(&v));
+			push_param(&mut api_params, "year_from", &v);
 		}
 		if let Some(v) = year_to {
 			qs.push("year_to", Some(&v));
+			push_param(&mut api_params, "year_to", &v);
 		}
 		if !author_ids.is_empty() {
 			qs.push("authors", Some(&author_ids.join(",")));
+			for a in &author_ids {
+				push_param(&mut api_params, "authors[]", a);
+			}
 		}
 		if !artist_ids.is_empty() {
 			qs.push("artists", Some(&artist_ids.join(",")));
+			for a in &artist_ids {
+				push_param(&mut api_params, "artists[]", a);
+			}
+		}
+
+		if let Ok(page_res) = fetch_manga_list_api(&base_url, &api_params) {
+			return Ok(page_res);
 		}
 
 		let url = format!("{base_url}/browse?{qs}");
@@ -452,7 +580,7 @@ impl Source for Comix {
 
 	fn get_manga_update(
 		&self,
-		manga: Manga,
+		mut manga: Manga,
 		needs_details: bool,
 		needs_chapters: bool,
 	) -> Result<Manga> {
@@ -469,22 +597,59 @@ impl Source for Comix {
 			.unwrap_or_else(|| format!("/title/{}", manga.key));
 		let title_url = helpers::resolve_url(&base_url, &title_path);
 
+		let mut details_done = !needs_details;
+		if needs_details {
+			let detail_path = format!("/manga/{}", manga.key);
+			if let Ok(res) =
+				web::call_signed_api::<ApiResponse<ComixManga>>(&base_url, &detail_path, &[], &title_path)
+			{
+				let detailed = res.result.into_manga(&base_url, true);
+				manga.copy_from(detailed);
+				if needs_chapters {
+					send_partial_result(&manga);
+				}
+				details_done = true;
+			}
+		}
+
+		let mut chapters_done = !needs_chapters;
+		if needs_chapters {
+			if let Ok(chapters) = fetch_chapters_api(&base_url, &manga.key, &title_path) {
+				let res = ChaptersHarvestResult {
+					hid: Some(manga.key.clone()),
+					count: chapters.len(),
+					complete: true,
+					chapters,
+				};
+				manga.chapters = Some(parse_chapter_list(res, &base_url));
+				chapters_done = true;
+			}
+		}
+
+		if details_done && chapters_done {
+			return Ok(manga);
+		}
+
 		let manga_cell = RefCell::new(manga);
-		let (_, chapters_opt) =
-			web::harvest_title_page(&title_url, needs_details, needs_chapters, |initial_data| {
+		let (_, chapters_opt) = web::harvest_title_page(
+			&title_url,
+			!details_done,
+			!chapters_done,
+			|initial_data| {
 				let hid = manga_cell.borrow().key.clone();
 				if let Some(comix_manga) = find_detail_manga(initial_data, Some(&hid)) {
 					let detailed = comix_manga.into_manga(&base_url, true);
 					let mut m = manga_cell.borrow_mut();
 					m.copy_from(detailed);
-					if needs_chapters {
+					if !chapters_done {
 						send_partial_result(&*m);
 					}
 				}
-			})?;
+			},
+		)?;
 
 		let mut manga = manga_cell.into_inner();
-		if needs_chapters && let Some(chapters_res) = chapters_opt {
+		if !chapters_done && let Some(chapters_res) = chapters_opt {
 			manga.chapters = Some(parse_chapter_list(chapters_res, &base_url));
 		}
 
@@ -507,6 +672,39 @@ impl Source for Comix {
 					false
 				}
 			});
+
+		let referer_path = valid_chapter_path
+			.clone()
+			.unwrap_or_else(|| format!("/title/{}", manga.key));
+
+		if let Ok(res) = web::call_signed_api::<ApiResponse<ChapterPagesResult>>(
+			&base_url,
+			&format!("/chapters/{}", chapter.key),
+			&[("v".into(), "0".into()), ("w".into(), "0".into())],
+			&referer_path,
+		) && !res.result.pages.items.is_empty()
+		{
+			let pages_dto = res.result.pages;
+			return Ok(pages_dto
+				.items
+				.iter()
+				.enumerate()
+				.map(|(index, p)| {
+					let mut context = PageContext::new();
+					context.insert("url".into(), p.url.clone());
+					if let Some(host) = extract_url_host(&p.url) {
+						let alt_hosts = pages_dto.alt_hosts(host, index);
+						if !alt_hosts.is_empty() {
+							context.insert("alt_hosts".into(), alt_hosts.join(","));
+						}
+					}
+					Page {
+						content: PageContent::url_context(p.url.clone(), context),
+						..Default::default()
+					}
+				})
+				.collect());
+		}
 
 		let chapter_url = if let Some(path) = valid_chapter_path {
 			helpers::resolve_url(&base_url, &path)
@@ -794,6 +992,17 @@ impl DeepLinkHandler for Comix {
 impl WebLoginHandler for Comix {
 	fn handle_web_login(&self, key: String, cookies: HashMap<String, String>) -> Result<bool> {
 		if key == VERIFY_KEY || key == VERIFY_WS_KEY {
+			let mirror_url = if key == VERIFY_WS_KEY {
+				ALT_MIRROR
+			} else {
+				DEFAULT_MIRROR
+			};
+			if let Some((_, val)) = cookies
+				.iter()
+				.find(|(name, v)| name.eq_ignore_ascii_case("waf_pass") && !v.trim().is_empty())
+			{
+				settings::set_waf_pass_for(mirror_url, val);
+			}
 			// The pass cookie is named `waf_pass`; accept any WAF/Cloudflare clearance cookie
 			// so the check can't get stuck if the site renames it.
 			let passed = cookies.iter().any(|(name, value)| {

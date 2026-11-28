@@ -1,17 +1,18 @@
 use crate::{
 	helpers, settings,
 	models::{
-		BrowseHarvestResult, ChaptersHarvestResult, InitialData, PagesHarvestResult,
-		TagsSearchResponse,
+		ApiRefusal, BrowseHarvestResult, ChaptersHarvestResult, EncryptedBody, InitialData,
+		PagesHarvestResult, TagsSearchResponse,
 	},
+	site_key::{self, CachedSiteKey, USER_AGENT},
 };
 use aidoku::{
 	Result,
-	alloc::{String, Vec, string::ToString},
-	helpers::uri::encode_uri_component,
+	alloc::{String, Vec, format, string::ToString},
+	helpers::uri::{QueryParameters, encode_uri_component},
 	imports::{
 		js::{JsContext, WebView},
-		net::Request,
+		net::{Request, Response},
 		std::sleep,
 	},
 	prelude::*,
@@ -97,6 +98,153 @@ fn wait_webview_ready(wv: &WebView, timeout_secs: i32, wait_for_initial_data: bo
 	bail!("Timed out waiting for Comix WebView to load")
 }
 
+const SYNC_WAF_COOKIE_JS: &str = "(() => { const m = document.cookie.match(/(?:^|;\\s*)waf_pass=([^;]+)/); return m ? decodeURIComponent(m[1]) : ''; })()";
+
+fn extract_waf_pass_from_header(raw: &str) -> Option<String> {
+	for segment in raw.split([',', ';']) {
+		let trimmed = segment.trim();
+		if let Some(value) = trimmed.strip_prefix("waf_pass=") {
+			let token = value.split(';').next().unwrap_or(value).trim();
+			if !token.is_empty() {
+				return Some(token.to_string());
+			}
+		}
+	}
+	None
+}
+
+fn capture_waf_pass(resp: &Response, base_url: &str) {
+	if let Some(raw) = resp
+		.get_header("Set-Cookie")
+		.or_else(|| resp.get_header("set-cookie"))
+		&& let Some(token) = extract_waf_pass_from_header(&raw)
+	{
+		settings::set_waf_pass_for(base_url, &token);
+	}
+}
+
+fn sync_waf_cookie_from_webview(wv: &WebView, url: &str) {
+	if let Ok(token) = wv.eval(SYNC_WAF_COOKIE_JS) {
+		let trimmed = token.trim();
+		if !trimmed.is_empty() {
+			settings::set_waf_pass_for(url, trimmed);
+		}
+	}
+}
+
+pub enum ApiError {
+	CaptchaRequired,
+	Other(String),
+}
+
+fn load_or_extract_key(base_url: &str, force_refresh: bool) -> core::result::Result<CachedSiteKey, ApiError> {
+	if !force_refresh
+		&& let Some(raw) = settings::cached_site_key()
+		&& let Some(cached) = CachedSiteKey::deserialize(&raw)
+	{
+		return Ok(cached);
+	}
+	let waf_pass = settings::waf_pass_for(base_url);
+	site_key::extract_site_key(base_url, waf_pass.as_deref())
+		.map_err(|e| ApiError::Other(e.to_string()))
+}
+
+pub fn call_signed_api<T: DeserializeOwned>(
+	base_url: &str,
+	api_path: &str,
+	params: &[(String, String)],
+	referer_path: &str,
+) -> core::result::Result<T, ApiError> {
+	let base = base_url.trim_end_matches('/');
+	let mut key_refreshed = false;
+	let mut gateway_retried = false;
+
+	loop {
+		let cached = load_or_extract_key(base, key_refreshed)?;
+		let sig = cached.key.sign(api_path, params);
+
+		let mut qs = QueryParameters::new();
+		for (k, v) in params {
+			qs.push(k, Some(v));
+		}
+		qs.push("_", Some(&sig));
+		let url = format!("{base}/api/v1{api_path}?{qs}");
+
+		let referer = if referer_path.starts_with("http") {
+			referer_path.to_string()
+		} else {
+			format!("{base}{referer_path}")
+		};
+
+		let mut req = Request::get(&url)
+			.map_err(|e| ApiError::Other(format!("{e:?}")))?
+			.header("User-Agent", USER_AGENT)
+			.header("Accept", "application/json")
+			.header("X-Requested-With", "XMLHttpRequest")
+			.header("X-Rt", "0")
+			.header("Referer", &referer);
+
+		if let Some(token) = settings::waf_pass_for(base) {
+			req = req.header("Cookie", &format!("waf_pass={token}"));
+		}
+
+		let resp = req
+			.send()
+			.map_err(|e| ApiError::Other(format!("{e:?}")))?;
+		capture_waf_pass(&resp, base);
+
+		let status = resp.status_code();
+		if (200..300).contains(&status) {
+			if let Some(build_id) = resp.get_header("x-build-id")
+				&& site_key::is_newer_build(&build_id, &cached.build)
+			{
+				settings::set_cached_site_key(None);
+			}
+			let encrypted = resp.get_header("x-enc").as_deref() == Some("2");
+			let raw_body = resp
+				.get_string()
+				.map_err(|e| ApiError::Other(format!("{e:?}")))?;
+			let payload = if encrypted {
+				let wrapper = serde_json::from_str::<EncryptedBody>(&raw_body)
+					.map_err(|e| ApiError::Other(format!("Encrypted wrapper JSON error: {e}")))?;
+				cached
+					.key
+					.decrypt(&wrapper.e)
+					.map_err(|e| ApiError::Other(e.to_string()))?
+			} else {
+				raw_body
+			};
+			let parsed = serde_json::from_str::<T>(&payload)
+				.map_err(|e| ApiError::Other(format!("API JSON parse error: {e}")))?;
+			settings::mark_verified(true);
+			return Ok(parsed);
+		}
+
+		let body = resp.get_string().unwrap_or_default();
+		let refusal = serde_json::from_str::<ApiRefusal>(&body).ok();
+		let err_str = refusal
+			.as_ref()
+			.and_then(|r| r.error.as_deref())
+			.unwrap_or("");
+		let code_str = refusal.as_ref().and_then(|r| r.code_str());
+
+		if err_str == "captcha_required" {
+			return Err(ApiError::CaptchaRequired);
+		}
+		if matches!(code_str.as_deref(), Some("key_retired" | "invalid_token")) && !key_refreshed {
+			settings::set_cached_site_key(None);
+			key_refreshed = true;
+			continue;
+		}
+		if status == 502 && !gateway_retried {
+			sleep(1);
+			gateway_retried = true;
+			continue;
+		}
+		return Err(ApiError::Other(format!("Comix API returned status {status}")));
+	}
+}
+
 /// Waits for the security check to clear, then reloads `url` and waits for the real page.
 /// Fails with `WAF_ERROR_MSG` if the check needs manual interaction or never clears.
 fn recover_from_waf(wv: &WebView, url: &str, wait_for_initial_data: bool) -> Result<()> {
@@ -120,6 +268,7 @@ fn recover_from_waf(wv: &WebView, url: &str, wait_for_initial_data: bool) -> Res
 	wv.load(Request::get(url)?)?;
 	match wait_webview_ready(wv, 20, wait_for_initial_data)? {
 		Ready::Page => {
+			sync_waf_cookie_from_webview(wv, url);
 			settings::mark_verified(true);
 			Ok(())
 		}
@@ -135,7 +284,10 @@ fn open_page(url: &str, wait_for_initial_data: bool) -> Result<WebView> {
 	let wv = WebView::new();
 	wv.load(Request::get(url)?)?;
 	match wait_webview_ready(&wv, 20, wait_for_initial_data)? {
-		Ready::Page => settings::mark_verified(true),
+		Ready::Page => {
+			sync_waf_cookie_from_webview(&wv, url);
+			settings::mark_verified(true);
+		}
 		Ready::Waf => recover_from_waf(&wv, url, wait_for_initial_data)?,
 	}
 	Ok(wv)
@@ -189,10 +341,15 @@ fn run_script<T: DeserializeOwned>(
 }
 
 fn try_http_initial_data(url: &str) -> Option<InitialData> {
-	let req = Request::get(url)
+	let mut req = Request::get(url)
 		.ok()?
+		.header("User-Agent", USER_AGENT)
 		.header("Accept", "text/html,application/xhtml+xml");
+	if let Some(token) = settings::waf_pass_for(url) {
+		req = req.header("Cookie", &format!("waf_pass={token}"));
+	}
 	let resp = req.send().ok()?;
+	capture_waf_pass(&resp, url);
 	if resp.status_code() >= 400 {
 		return None;
 	}
@@ -242,20 +399,29 @@ pub fn fetch_tag_ids(base_url: &str, term_type: &str, raw_csv: &str) -> Vec<Stri
 			"{base}/api/v1/tags/search?type={term_type}&q={}&limit=20",
 			encode_uri_component(query)
 		);
-		if let Ok(req) = Request::get(&url).map(|r| r.header("Accept", "application/json"))
-			&& let Ok(resp) = req.send()
-			&& resp.status_code() < 400
-			&& let Ok(parsed) = resp.get_json_owned::<TagsSearchResponse>()
-			&& let Some(items) = parsed.result
-		{
-			let picked = items
-				.iter()
-				.find(|item| item.label.eq_ignore_ascii_case(query))
-				.or_else(|| items.first());
-			if let Some(item) = picked {
-				let id_str = item.id.to_string();
-				if !ids.contains(&id_str) {
-					ids.push(id_str);
+		if let Ok(mut req) = Request::get(&url).map(|r| {
+			r.header("User-Agent", USER_AGENT)
+				.header("Accept", "application/json")
+				.header("X-Requested-With", "XMLHttpRequest")
+				.header("Referer", &format!("{base}/browse"))
+		}) {
+			if let Some(token) = settings::waf_pass_for(base) {
+				req = req.header("Cookie", &format!("waf_pass={token}"));
+			}
+			if let Ok(resp) = req.send()
+				&& resp.status_code() < 400
+				&& let Ok(parsed) = resp.get_json_owned::<TagsSearchResponse>()
+				&& let Some(items) = parsed.result
+			{
+				let picked = items
+					.iter()
+					.find(|item| item.label.eq_ignore_ascii_case(query))
+					.or_else(|| items.first());
+				if let Some(item) = picked {
+					let id_str = item.id.to_string();
+					if !ids.contains(&id_str) {
+						ids.push(id_str);
+					}
 				}
 			}
 		}

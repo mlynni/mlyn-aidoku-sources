@@ -5,6 +5,14 @@ use aidoku::{
 };
 use serde::{Deserialize, Deserializer, de};
 
+fn null_default<'de, D, T>(deserializer: D) -> core::result::Result<T, D::Error>
+where
+	D: Deserializer<'de>,
+	T: Default + Deserialize<'de>,
+{
+	Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 pub struct InitialData {
 	pub page: Option<String>,
@@ -23,16 +31,16 @@ pub struct InitialListPayload {
 pub struct ComixManga {
 	pub hid: String,
 	pub title: String,
-	#[serde(default, alias = "alt_titles")]
+	#[serde(default, alias = "alt_titles", deserialize_with = "null_default")]
 	pub alt_titles: Vec<String>,
 	pub synopsis: Option<String>,
-	#[serde(default)]
+	#[serde(default, deserialize_with = "null_default")]
 	pub r#type: String,
 	#[serde(alias = "cover", alias = "thumbnail", alias = "thumb")]
 	pub poster: Option<Poster>,
-	#[serde(default)]
+	#[serde(default, deserialize_with = "null_default")]
 	pub status: String,
-	#[serde(default, alias = "content_rating")]
+	#[serde(default, alias = "content_rating", deserialize_with = "null_default")]
 	pub content_rating: ComixContentRating,
 	#[serde(default, alias = "original_language")]
 	pub original_language: Option<String>,
@@ -530,4 +538,203 @@ pub struct PagesHarvestResult {
 pub struct HarvestedPage {
 	pub index: usize,
 	pub url: String,
+}
+
+#[derive(Deserialize)]
+pub struct ApiResponse<T> {
+	pub result: T,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ApiMeta {
+	#[serde(default, deserialize_with = "null_default")]
+	pub page: i32,
+	#[serde(
+		default,
+		alias = "last_page",
+		alias = "lastPage",
+		deserialize_with = "null_default"
+	)]
+	pub last_page: i32,
+}
+
+#[derive(Deserialize)]
+pub struct MangaItems {
+	#[serde(default, deserialize_with = "null_default")]
+	pub items: Vec<ComixManga>,
+	#[serde(default)]
+	pub meta: ApiMeta,
+}
+
+#[derive(Deserialize)]
+pub struct ChapterItems {
+	#[serde(default, deserialize_with = "null_default")]
+	pub items: Vec<ApiChapter>,
+	#[serde(default)]
+	pub meta: ApiMeta,
+}
+
+#[derive(Deserialize)]
+pub struct ApiUploader {
+	pub id: Option<i64>,
+	pub name: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ApiChapter {
+	pub id: i64,
+	#[serde(default, deserialize_with = "null_default")]
+	pub url: String,
+	#[serde(default, deserialize_with = "null_default")]
+	pub number: f32,
+	#[serde(default, deserialize_with = "null_default")]
+	pub volume: f32,
+	pub name: Option<String>,
+	#[serde(default, deserialize_with = "null_default")]
+	pub votes: i64,
+	#[serde(
+		default,
+		alias = "created_at_formatted",
+		alias = "createdAtFormatted",
+		deserialize_with = "null_default"
+	)]
+	pub created_at_formatted: String,
+	pub group: Option<ApiUploader>,
+	pub creator: Option<ApiUploader>,
+	#[serde(
+		default,
+		alias = "is_official",
+		alias = "isOfficial",
+		deserialize_with = "null_default"
+	)]
+	pub is_official: bool,
+}
+
+impl ApiChapter {
+	pub fn into_harvested(self) -> HarvestedChapter {
+		let group_name = self
+			.group
+			.as_ref()
+			.and_then(|g| g.name.as_deref())
+			.or_else(|| self.creator.as_ref().and_then(|c| c.name.as_deref()))
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(String::from)
+			.or_else(|| self.is_official.then(|| String::from("Official")));
+		let group_id = self
+			.group
+			.as_ref()
+			.and_then(|g| g.id)
+			.or_else(|| self.is_official.then_some(10702));
+		let group = group_name.map(|name| HarvestedGroup {
+			id: group_id,
+			name,
+			is_official: self.is_official,
+		});
+		HarvestedChapter {
+			id: self.id,
+			number: self.number,
+			volume: (self.volume > 0.0).then_some(self.volume),
+			url: self.url,
+			text: self.created_at_formatted,
+			name: self.name,
+			votes: self.votes,
+			group,
+		}
+	}
+}
+
+#[derive(Deserialize)]
+pub struct ApiRefusal {
+	pub code: Option<serde_json::Value>,
+	pub error: Option<String>,
+}
+
+impl ApiRefusal {
+	pub fn code_str(&self) -> Option<String> {
+		match self.code.as_ref()? {
+			serde_json::Value::String(s) => Some(s.clone()),
+			serde_json::Value::Number(n) => Some(n.to_string()),
+			_ => None,
+		}
+	}
+}
+
+#[derive(Deserialize)]
+pub struct EncryptedBody {
+	pub e: String,
+}
+
+#[derive(Deserialize)]
+pub struct ChapterPagesResult {
+	pub pages: ApiChapterPages,
+}
+
+#[derive(Deserialize)]
+pub struct ApiChapterPages {
+	#[serde(default, deserialize_with = "null_default")]
+	pub items: Vec<ApiPageDto>,
+	#[serde(default, deserialize_with = "null_default")]
+	pub alt: Vec<String>,
+	pub alt2: Option<serde_json::Value>,
+	#[serde(alias = "alt_node")]
+	pub alt_node: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct ApiPageDto {
+	pub url: String,
+}
+
+fn json_primitive_string(val: Option<&serde_json::Value>) -> Option<String> {
+	match val? {
+		serde_json::Value::String(s) => {
+			let t = s.trim();
+			(!t.is_empty()).then(|| t.to_string())
+		}
+		serde_json::Value::Number(n) => Some(n.to_string()),
+		_ => None,
+	}
+}
+
+impl ApiChapterPages {
+	pub fn alt_hosts(&self, host: &str, index: usize) -> Vec<String> {
+		let Some((label, domain)) = host.split_once('.') else {
+			return Vec::new();
+		};
+		let mut domains: Vec<String> = Vec::new();
+		domains.push(domain.to_string());
+		if !self.alt.is_empty()
+			&& let Some(d) = self.alt.get(index % self.alt.len())
+		{
+			let d = d.trim();
+			if !d.is_empty() && !domains.iter().any(|x| x == d) {
+				domains.push(d.to_string());
+			}
+		}
+		if let Some(d) = json_primitive_string(self.alt2.as_ref())
+			&& !domains.iter().any(|x| x == &d)
+		{
+			domains.push(d);
+		}
+
+		let mut labels: Vec<String> = Vec::new();
+		labels.push(label.to_string());
+		if let Some(l) = json_primitive_string(self.alt_node.as_ref())
+			&& !labels.iter().any(|x| x == &l)
+		{
+			labels.push(l);
+		}
+
+		let mut out = Vec::new();
+		for l in &labels {
+			for d in &domains {
+				let candidate = format!("{l}.{d}");
+				if candidate != host && !out.contains(&candidate) {
+					out.push(candidate);
+				}
+			}
+		}
+		out
+	}
 }

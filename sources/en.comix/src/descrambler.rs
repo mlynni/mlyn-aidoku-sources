@@ -186,25 +186,58 @@ fn descramble_image(image: &ImageRef, seed: u32, algo: Option<&str>) -> ImageRef
 	canvas.get_image()
 }
 
-pub fn fallback_urls(url: &str) -> Vec<String> {
+fn swap_host_with_retry(url: &str, new_host: &str, retry: usize) -> Option<String> {
+	let rest = url
+		.strip_prefix("https://")
+		.map(|r| ("https://", r))
+		.or_else(|| url.strip_prefix("http://").map(|r| ("http://", r)))?;
+	let (scheme, after_scheme) = rest;
+	let path_start = after_scheme
+		.find(['/', '?', '#'])
+		.unwrap_or(after_scheme.len());
+	let suffix = &after_scheme[path_start..];
+	let without_frag = suffix.split('#').next().unwrap_or(suffix);
+	let sep = if without_frag.contains('?') { '&' } else { '?' };
+	Some(format!("{scheme}{new_host}{without_frag}{sep}r={retry}"))
+}
+
+pub fn fallback_urls(url: &str, alt_hosts: Option<&str>) -> Vec<String> {
 	let mut out = Vec::new();
-	let sep = if url.contains('?') { '&' } else { '?' };
+	if let Some(hosts) = alt_hosts {
+		for (i, host) in hosts
+			.split(',')
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.enumerate()
+		{
+			if let Some(candidate) = swap_host_with_retry(url, host, i + 1)
+				&& !out.contains(&candidate)
+			{
+				out.push(candidate);
+			}
+		}
+	}
+	let clean_url = url.split('#').next().unwrap_or(url);
+	let sep = if clean_url.contains('?') { '&' } else { '?' };
 	for retry in 1..=2 {
-		out.push(format!("{url}{sep}r={retry}"));
+		let candidate = format!("{clean_url}{sep}r={retry}");
+		if !out.contains(&candidate) {
+			out.push(candidate);
+		}
 	}
 	for prefix in PATH_PREFIXES {
-		if let Some(pos) = url.find(prefix) {
+		if let Some(pos) = clean_url.find(prefix) {
 			for replacement in FALLBACK_PATHS {
 				if replacement == prefix {
 					continue;
 				}
 				let candidate = format!(
 					"{}{}{}",
-					&url[..pos],
+					&clean_url[..pos],
 					replacement,
-					&url[pos + prefix.len()..]
+					&clean_url[pos + prefix.len()..]
 				);
-				if candidate != url && !out.contains(&candidate) {
+				if candidate != clean_url && !out.contains(&candidate) {
 					out.push(candidate);
 				}
 			}
@@ -229,7 +262,10 @@ pub fn process_page_image(
 			.as_deref()
 			.or_else(|| context.as_ref().and_then(|c| c.get("url").map(String::as_str)))
 	{
-		for fallback in fallback_urls(orig_url) {
+		let alt_hosts = context
+			.as_ref()
+			.and_then(|c| c.get("alt_hosts").map(String::as_str));
+		for fallback in fallback_urls(orig_url, alt_hosts) {
 			if let Ok(req) = Request::get(&fallback)
 				&& let Ok(resp) = req.send()
 				&& resp.status_code() < 400

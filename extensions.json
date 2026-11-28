@@ -28,15 +28,15 @@
 			"name": "Comix",
 			"mihonPath": "src/en/comix",
 			"aidokuPath": "sources/en.comix",
-			"version": 36,
+			"version": 37,
 			"languages": [
 				"en"
 			],
 			"contentRating": 1,
 			"baseURL": "https://comix.to",
 			"minAppVersion": "0.8.4",
-			"packageFile": "en.comix-v36.aix",
-			"iconFile": "en.comix-v36.png",
+			"packageFile": "en.comix-v37.aix",
+			"iconFile": "en.comix-v37.png",
 			"status": "ready",
 			"autoSync": true,
 			"customRust": true,
