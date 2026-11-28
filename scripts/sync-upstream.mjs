@@ -18,9 +18,11 @@ const AIDOKU_REPO = "https://github.com/Aidoku-Community/sources.git";
 
 const DEFAULT_GEMINI_MODELS = [
 	"gemini-3.1-pro-preview",
+	"gemini-3.8-flash",
 	"gemini-3-flash-preview",
-	"gemini-2.5-flash",
 ];
+
+let cachedDiscoveredModels;
 
 const MAX_CRATE_FILE_CHARS = 45_000;
 const MAX_DIFF_CHARS = 100_000;
@@ -404,15 +406,87 @@ function parseGeminiJson(rawText) {
 	}
 }
 
+function rankGeminiModel(id) {
+	const verMatch = id.match(/^gemini-(\d+)(?:\.(\d+))?/i);
+	const versionScore = verMatch
+		? Number(verMatch[1]) * 100 + Number(verMatch[2] ?? 0)
+		: 0;
+	const isLite = /(?:^|-)lite\b/i.test(id) ? 1 : 0;
+	const tier = /(?:^|-)pro\b/i.test(id) ? 0 : /(?:^|-)flash\b/i.test(id) ? 1 : 2;
+	const isUnstable = /(preview|exp)/i.test(id) ? 1 : 0;
+	return { versionScore, isLite, tier, isUnstable };
+}
+
+async function discoverGeminiModels(apiKey) {
+	if (cachedDiscoveredModels !== undefined) {
+		return cachedDiscoveredModels;
+	}
+
+	const excludedRe =
+		/(embed|imagen|veo|tts|audio|live|robotics|computer-use|image|vision|aqa|gemma|deep-research|nano)/i;
+
+	try {
+		const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}&pageSize=100`;
+		const resp = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+		if (!resp.ok) {
+			cachedDiscoveredModels = null;
+			return null;
+		}
+		const data = await resp.json();
+		const candidates = [];
+		for (const m of data?.models || []) {
+			if (
+				!Array.isArray(m?.supportedGenerationMethods) ||
+				!m.supportedGenerationMethods.includes("generateContent") ||
+				typeof m?.name !== "string" ||
+				!m.name.startsWith("models/gemini-")
+			) {
+				continue;
+			}
+			const id = m.name.slice("models/".length);
+			if (excludedRe.test(id)) continue;
+			candidates.push(id);
+		}
+
+		const ranked = Array.from(new Set(candidates))
+			.sort((a, b) => {
+				const ra = rankGeminiModel(a);
+				const rb = rankGeminiModel(b);
+				return (
+					rb.versionScore - ra.versionScore ||
+					ra.isLite - rb.isLite ||
+					ra.tier - rb.tier ||
+					ra.isUnstable - rb.isUnstable ||
+					a.localeCompare(b)
+				);
+			})
+			.slice(0, 6);
+
+		if (ranked.length > 0) {
+			console.log(`  [ai] Discovered models: ${ranked.join(", ")}`);
+			cachedDiscoveredModels = ranked;
+		} else {
+			cachedDiscoveredModels = null;
+		}
+		return cachedDiscoveredModels;
+	} catch {
+		cachedDiscoveredModels = null;
+		return null;
+	}
+}
+
 async function callGemini(apiKey, contents, pinnedModel = null) {
 	const envModel = process.env.GEMINI_MODEL?.trim();
 	const models = pinnedModel
 		? [pinnedModel]
 		: envModel
 			? [envModel]
-			: DEFAULT_GEMINI_MODELS;
+			: (await discoverGeminiModels(apiKey)) || DEFAULT_GEMINI_MODELS;
 
 	let lastErr = null;
+	let lastStatus = "error";
+	const attempts = [];
+
 	for (const model of models) {
 		const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 		const delays = [5000, 10000];
@@ -434,11 +508,13 @@ async function callGemini(apiKey, contents, pinnedModel = null) {
 					}),
 				});
 			} catch (fetchErr) {
-				lastErr = `gemini-http-fetch (${model}): ${fetchErr.message}`;
+				lastStatus = "fetch";
+				lastErr = fetchErr.message;
 				if (retry < 2) {
 					await new Promise((r) => setTimeout(r, delays[retry]));
 					continue;
 				}
+				attempts.push(`${model}:fetch`);
 				break;
 			}
 
@@ -455,19 +531,29 @@ async function callGemini(apiKey, contents, pinnedModel = null) {
 			}
 
 			const errText = await attempt.text();
-			lastErr = `gemini-http-${attempt.status} (${model}): ${errText.slice(0, 200)}`;
+			lastStatus = String(attempt.status);
+			lastErr = errText.slice(0, 200);
 			if (attempt.status === 503 && retry < 2) {
 				await new Promise((r) => setTimeout(r, delays[retry]));
 				continue;
 			}
+			attempts.push(`${model}:${attempt.status}`);
 			if (attempt.status !== 404 && attempt.status !== 429 && attempt.status !== 503) {
-				return { ok: false, reason: lastErr };
+				return {
+					ok: false,
+					reason: `gemini-http-${attempt.status} [${attempts.join(", ")}]: ${lastErr}`,
+				};
 			}
 			break;
 		}
 	}
 
-	return { ok: false, reason: lastErr || "gemini-no-available-model" };
+	return {
+		ok: false,
+		reason: attempts.length
+			? `gemini-http-${lastStatus} [${attempts.join(", ")}]: ${lastErr || ""}`
+			: "gemini-no-available-model",
+	};
 }
 
 async function applyGeminiPort(entry, crateDir, mihonDir, diffText, forced = false) {
