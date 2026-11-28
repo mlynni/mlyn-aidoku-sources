@@ -250,33 +250,41 @@ Determine whether the Mihon diff changes runtime behavior (API endpoints, CSS se
 
 	const models = process.env.GEMINI_MODEL
 		? [process.env.GEMINI_MODEL]
-		: ["gemini-2.5-flash", "gemini-3-flash-preview", "gemini-3.1-pro-preview"];
+		: ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
 
 	let resp = null;
 	let lastErr = null;
 	for (const model of models) {
 		const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-		const attempt = await fetch(endpoint, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({
-				contents: [{ role: "user", parts: [{ text: prompt }] }],
-				generationConfig: {
-					temperature: 0.1,
-					responseMimeType: "application/json",
-				},
-			}),
-		});
+		for (let retry = 0; retry < 3; retry++) {
+			const attempt = await fetch(endpoint, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					contents: [{ role: "user", parts: [{ text: prompt }] }],
+					generationConfig: {
+						temperature: 0.1,
+						responseMimeType: "application/json",
+					},
+				}),
+			});
 
-		if (attempt.ok) {
-			resp = attempt;
+			if (attempt.ok) {
+				resp = attempt;
+				break;
+			}
+			const errText = await attempt.text();
+			lastErr = `gemini-http-${attempt.status} (${model}): ${errText.slice(0, 200)}`;
+			if (attempt.status === 503 && retry < 2) {
+				await new Promise((r) => setTimeout(r, 4000));
+				continue;
+			}
+			if (attempt.status !== 404 && attempt.status !== 429 && attempt.status !== 503) {
+				return { applied: false, reason: lastErr };
+			}
 			break;
 		}
-		const errText = await attempt.text();
-		lastErr = `gemini-http-${attempt.status} (${model}): ${errText.slice(0, 200)}`;
-		if (attempt.status !== 404 && attempt.status !== 429) {
-			return { applied: false, reason: lastErr };
-		}
+		if (resp) break;
 	}
 
 	if (!resp) {
