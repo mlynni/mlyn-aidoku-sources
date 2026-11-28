@@ -299,10 +299,6 @@ impl Source for Comix {
 			.map(String::from);
 
 		let mut qs = QueryParameters::new();
-		if let Some(ref q) = query_text {
-			qs.push("q", Some(q));
-		}
-		qs.push("page", Some(&page.to_string()));
 
 		let mut sort_param: Option<String> = None;
 		let mut content_rating_override: Option<String> = None;

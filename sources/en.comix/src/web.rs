@@ -132,6 +132,7 @@ fn sync_waf_cookie_from_webview(wv: &WebView, url: &str) {
 	}
 }
 
+#[allow(dead_code)]
 pub enum ApiError {
 	CaptchaRequired,
 	Other(String),
@@ -146,7 +147,7 @@ fn load_or_extract_key(base_url: &str, force_refresh: bool) -> core::result::Res
 	}
 	let waf_pass = settings::waf_pass_for(base_url);
 	site_key::extract_site_key(base_url, waf_pass.as_deref())
-		.map_err(|e| ApiError::Other(e.to_string()))
+		.map_err(|e| ApiError::Other(format!("{e:?}")))
 }
 
 pub fn call_signed_api<T: DeserializeOwned>(
@@ -210,7 +211,7 @@ pub fn call_signed_api<T: DeserializeOwned>(
 				cached
 					.key
 					.decrypt(&wrapper.e)
-					.map_err(|e| ApiError::Other(e.to_string()))?
+					.map_err(|e| ApiError::Other(format!("{e:?}")))?
 			} else {
 				raw_body
 			};
