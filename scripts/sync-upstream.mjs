@@ -248,7 +248,8 @@ Determine whether the Mihon diff changes runtime behavior (API endpoints, CSS se
 - Otherwise, respond with ONLY valid JSON containing the complete updated file contents for ONLY the files in src/, res/, or assets/ that need changes (never include res/source.json):
   { "needsUpdate": true, "summary": "what changed", "files": { "src/lib.rs": "full updated file content" } }`;
 
-	const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=${encodeURIComponent(apiKey)}`;
+	const model = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
+	const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 	const resp = await fetch(endpoint, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -492,9 +493,15 @@ async function main() {
 			);
 		}
 
-		entry.lastMihonCommit = latestMihon;
-		if (latestAidoku) entry.lastAidokuCommit = latestAidoku;
-		registryDirty = true;
+		const isTransientAiError =
+			!aiResult.applied &&
+			/^(gemini-http-|empty-gemini-response|invalid-gemini-json)/.test(aiResult.reason || "");
+
+		if (!isTransientAiError) {
+			entry.lastMihonCommit = latestMihon;
+			if (latestAidoku) entry.lastAidokuCommit = latestAidoku;
+			registryDirty = true;
+		}
 	}
 
 	if (registryDirty && !dryRun) {
