@@ -16,6 +16,21 @@ const SCRATCH_UPSTREAM =
 const MIHON_REPO = "https://github.com/keiyoushi/extensions-source.git";
 const AIDOKU_REPO = "https://github.com/Aidoku-Community/sources.git";
 
+const DEFAULT_GEMINI_MODELS = [
+	"gemini-3.1-pro-preview",
+	"gemini-3-flash-preview",
+	"gemini-2.5-flash",
+];
+
+const MAX_CRATE_FILE_CHARS = 45_000;
+const MAX_DIFF_CHARS = 100_000;
+const MAX_MIHON_FILES_CHARS = 180_000;
+const MAX_ERROR_CHARS = 12_000;
+const MAX_COMPILE_ATTEMPTS = 3;
+
+const FORBIDDEN_084_WEBVIEW_RE =
+	/\.(eval_async|add_user_script|set_rule_list|get_cookies|delete_cookie|delete_all_cookies)\s*\(/g;
+
 function runGit(args, cwd) {
 	return execFileSync("git", args, {
 		cwd,
@@ -200,159 +215,432 @@ function syncBaseUrls(crateDir, info) {
 	return changed;
 }
 
+function collectFilesMap(baseDir, filterFn, prefix = "") {
+	const files = {};
+	if (!fs.existsSync(baseDir)) return files;
+
+	const walk = (dir) => {
+		const entries = fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
+			a.name.localeCompare(b.name)
+		);
+		for (const item of entries) {
+			const full = path.join(dir, item.name);
+			if (item.isDirectory()) {
+				walk(full);
+				continue;
+			}
+			if (!item.isFile()) continue;
+			const rel = path.relative(baseDir, full).replace(/\\/g, "/");
+			if (!filterFn(item.name, rel)) continue;
+			const key = prefix ? `${prefix}/${rel}` : rel;
+			files[key] = fs.readFileSync(full, "utf8");
+		}
+	};
+
+	walk(baseDir);
+	return files;
+}
+
 function collectCrateFiles(crateDir) {
 	const files = {};
 	for (const sub of ["src", "res", "assets"]) {
-		const dir = path.join(crateDir, sub);
-		if (!fs.existsSync(dir)) continue;
-		for (const f of fs.readdirSync(dir)) {
-			if (f.endsWith(".png")) continue;
-			const full = path.join(dir, f);
-			if (!fs.statSync(full).isFile()) continue;
-			files[`${sub}/${f}`] = fs.readFileSync(full, "utf8");
-		}
+		const subFiles = collectFilesMap(
+			path.join(crateDir, sub),
+			(name) => !/\.(png|jpg|jpeg|webp|gif|aix|wasm)$/i.test(name),
+			sub
+		);
+		Object.assign(files, subFiles);
 	}
 	return files;
 }
 
-async function applyGeminiPort(entry, crateDir, diffText) {
+function collectMihonFiles(mihonDir) {
+	return collectFilesMap(mihonDir, (name) => {
+		const lower = name.toLowerCase();
+		return (
+			lower.endsWith(".kt") ||
+			lower.endsWith(".kts") ||
+			lower.endsWith(".js") ||
+			lower === "build.gradle" ||
+			lower === "build.gradle.kts"
+		);
+	});
+}
+
+function formatMihonFilesBlock(mihonFiles, maxTotalChars) {
+	const sorted = Object.entries(mihonFiles).sort(([a], [b]) => {
+		const rank = (rel) => {
+			if (rel.endsWith(".kt") || rel.endsWith(".js")) return 0;
+			if (rel.toLowerCase().includes("gradle")) return 1;
+			return 2;
+		};
+		return rank(a) - rank(b) || a.localeCompare(b);
+	});
+
+	let total = 0;
+	const blocks = [];
+	const omitted = [];
+
+	for (const [rel, content] of sorted) {
+		const ext = rel.endsWith(".js") ? "javascript" : rel.endsWith(".kt") ? "kotlin" : "";
+		const block = `### ${rel}\n\`\`\`${ext}\n${content}\n\`\`\``;
+		if (total + block.length > maxTotalChars) {
+			if (total === 0) {
+				const sliceLen = Math.max(1000, maxTotalChars - rel.length - 64);
+				blocks.push(
+					`### ${rel} (truncated)\n\`\`\`${ext}\n${content.slice(0, sliceLen)}\n\`\`\``
+				);
+				total = maxTotalChars;
+			} else {
+				omitted.push(rel);
+			}
+			continue;
+		}
+		blocks.push(block);
+		total += block.length + 2;
+	}
+
+	if (omitted.length > 0) {
+		blocks.push(`_Omitted due to context budget: ${omitted.join(", ")}_`);
+	}
+
+	return blocks.join("\n\n");
+}
+
+function isBefore090(versionStr) {
+	const parts = String(versionStr || "0.7.1")
+		.trim()
+		.split(".")
+		.map((n) => Number.parseInt(n, 10) || 0);
+	const major = parts[0] ?? 0;
+	const minor = parts[1] ?? 0;
+	return major === 0 && minor < 9;
+}
+
+function checkAidoku084Compat(entry, crateDir) {
+	const errors = [];
+
+	const resFiles = collectFilesMap(path.join(crateDir, "res"), (name) =>
+		name.toLowerCase().endsWith(".json")
+	);
+	for (const [rel, raw] of Object.entries(resFiles)) {
+		try {
+			JSON.parse(raw);
+		} catch (err) {
+			errors.push(`Invalid JSON in res/${rel}: ${err.message}`);
+		}
+	}
+
+	if (isBefore090(entry.minAppVersion || "0.7.1")) {
+		const rustFiles = collectFilesMap(path.join(crateDir, "src"), (name) =>
+			name.toLowerCase().endsWith(".rs")
+		);
+		let usesDynamicSettings = false;
+		let usesLoginSetting = false;
+
+		for (const [rel, code] of Object.entries(rustFiles)) {
+			const matches = code.match(FORBIDDEN_084_WEBVIEW_RE);
+			if (matches && matches.length > 0) {
+				const unique = Array.from(new Set(matches.map((m) => m.replace(/^\.|\s*\($/g, ""))));
+				errors.push(
+					`src/${rel} calls Aidoku 0.9.0-only WebView method(s) [${unique.join(", ")}] while minAppVersion=${entry.minAppVersion || "0.7.1"}`
+				);
+			}
+			if (/\bDynamicSettings\b/.test(code)) usesDynamicSettings = true;
+			if (/\bLoginSetting\b/.test(code)) usesLoginSetting = true;
+		}
+
+		const settingsJson = resFiles["settings.json"];
+		if (settingsJson && /"type"\s*:\s*"login"/.test(settingsJson)) {
+			usesLoginSetting = true;
+		}
+		if (usesDynamicSettings && usesLoginSetting) {
+			errors.push(
+				`DynamicSettings cannot be combined with LoginSetting / "type":"login" when minAppVersion < 0.9.0 (Postcard ABI breaks Settings on Aidoku 0.8.4).`
+			);
+		}
+	}
+
+	return { ok: errors.length === 0, errors };
+}
+
+function restoreBackups(backups) {
+	for (const [abs, prev] of backups.entries()) {
+		if (prev === null) {
+			fs.rmSync(abs, { force: true });
+		} else {
+			fs.mkdirSync(path.dirname(abs), { recursive: true });
+			fs.writeFileSync(abs, prev, "utf8");
+		}
+	}
+}
+
+function resolveSafeCrateRelPath(crateDir, relPath) {
+	if (typeof relPath !== "string") return null;
+	const normalized = relPath.replace(/\\/g, "/").replace(/^\.\/+/, "");
+	if (
+		!normalized.startsWith("src/") &&
+		!normalized.startsWith("res/") &&
+		!normalized.startsWith("assets/")
+	) {
+		return null;
+	}
+	if (normalized === "res/source.json") return null;
+	const abs = path.resolve(crateDir, normalized);
+	const crateRoot = path.resolve(crateDir) + path.sep;
+	if (!abs.startsWith(crateRoot)) return null;
+	return { relPath: normalized, abs };
+}
+
+function parseGeminiJson(rawText) {
+	try {
+		return JSON.parse(rawText);
+	} catch {
+		const match = rawText.match(/```(?:json)?\s*([\s\S]*?)```/i);
+		if (match) {
+			return JSON.parse(match[1].trim());
+		}
+		throw new Error("invalid-gemini-json");
+	}
+}
+
+async function callGemini(apiKey, contents, pinnedModel = null) {
+	const envModel = process.env.GEMINI_MODEL?.trim();
+	const models = pinnedModel
+		? [pinnedModel]
+		: envModel
+			? [envModel]
+			: DEFAULT_GEMINI_MODELS;
+
+	let lastErr = null;
+	for (const model of models) {
+		const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+		const delays = [5000, 10000];
+
+		for (let retry = 0; retry < 3; retry++) {
+			let attempt;
+			try {
+				attempt = await fetch(endpoint, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					signal: AbortSignal.timeout(180_000),
+					body: JSON.stringify({
+						contents,
+						generationConfig: {
+							temperature: 0.1,
+							responseMimeType: "application/json",
+							maxOutputTokens: 65536,
+						},
+					}),
+				});
+			} catch (fetchErr) {
+				lastErr = `gemini-http-fetch (${model}): ${fetchErr.message}`;
+				if (retry < 2) {
+					await new Promise((r) => setTimeout(r, delays[retry]));
+					continue;
+				}
+				break;
+			}
+
+			if (attempt.ok) {
+				const data = await attempt.json();
+				const rawText = (data?.candidates?.[0]?.content?.parts || [])
+					.map((p) => p?.text || "")
+					.join("")
+					.trim();
+				if (!rawText) {
+					return { ok: false, reason: "empty-gemini-response" };
+				}
+				return { ok: true, model, rawText };
+			}
+
+			const errText = await attempt.text();
+			lastErr = `gemini-http-${attempt.status} (${model}): ${errText.slice(0, 200)}`;
+			if (attempt.status === 503 && retry < 2) {
+				await new Promise((r) => setTimeout(r, delays[retry]));
+				continue;
+			}
+			if (attempt.status !== 404 && attempt.status !== 429 && attempt.status !== 503) {
+				return { ok: false, reason: lastErr };
+			}
+			break;
+		}
+	}
+
+	return { ok: false, reason: lastErr || "gemini-no-available-model" };
+}
+
+async function applyGeminiPort(entry, crateDir, mihonDir, diffText, forced = false) {
 	const apiKey = process.env.GEMINI_API_KEY;
-	if (!apiKey || !diffText.trim()) {
-		return { applied: false, reason: apiKey ? "empty-diff" : "no-api-key" };
+	if (!apiKey) {
+		return { applied: false, reason: "no-api-key" };
+	}
+
+	const mihonFiles = collectMihonFiles(mihonDir);
+	if (!forced && !diffText.trim() && Object.keys(mihonFiles).length === 0) {
+		return { applied: false, reason: "empty-diff" };
 	}
 
 	const currentFiles = collectCrateFiles(crateDir);
 	const filesBlock = Object.entries(currentFiles)
-		.map(([rel, content]) => `### ${rel}\n\`\`\`\n${content.slice(0, 12000)}\n\`\`\``)
+		.map(([rel, content]) => {
+			const clipped =
+				content.length > MAX_CRATE_FILE_CHARS
+					? `${content.slice(0, MAX_CRATE_FILE_CHARS)}\n/* ... truncated ... */`
+					: content;
+			return `### ${rel}\n\`\`\`\n${clipped}\n\`\`\``;
+		})
 		.join("\n\n");
 
-	const prompt = `You are porting an upstream Mihon extension update (Kotlin/JS diff) to an existing Aidoku Rust (aidoku v0.3.0 / #![no_std]) extension crate "${entry.id}" (minAppVersion: "${entry.minAppVersion || "0.7.1"}").
+	const mihonBlock = formatMihonFilesBlock(mihonFiles, MAX_MIHON_FILES_CHARS);
+	const diffBlock = diffText.trim()
+		? `Upstream Mihon git diff for ${entry.mihonPath}:\n\`\`\`diff\n${diffText.slice(0, MAX_DIFF_CHARS)}\n\`\`\``
+		: `Forced sync requested against current Mihon HEAD (${entry.mihonPath}); compare full Mihon source files below with the current Aidoku crate.`;
 
-Upstream Mihon diff for ${entry.mihonPath}:
-\`\`\`diff
-${diffText.slice(0, 35000)}
-\`\`\`
+	const prompt = `You are porting an upstream Mihon extension (${entry.mihonPath}) to an existing Aidoku Rust (aidoku v0.3.0 / #![no_std], Rust edition 2024) extension crate "${entry.id}" (minAppVersion: "${entry.minAppVersion || "0.7.1"}").
+
+${diffBlock}
+
+Full current Mihon source files (${entry.mihonPath}):
+${mihonBlock}
 
 Current Aidoku crate files:
 ${filesBlock}
 
-Aidoku compatibility constraints (CRITICAL):
-- Target is #![no_std] Rust edition 2024 (use aidoku::alloc::{...}, include aidoku::alloc::string::ToString if calling .to_string()).
-- If minAppVersion < 0.9.0: NEVER combine DynamicSettings with LoginSetting (Postcard ABI mismatch on Aidoku 0.8.4), and NEVER call 0.9.0-only WebView methods (eval_async, add_user_script, set_rule_list, get_cookies, delete_cookie, delete_all_cookies); use WebView::new(), load(), and eval() polling.
-- Never alter res/source.json info.version (the sync script bumps it automatically).
+Aidoku compatibility & Rust constraints (CRITICAL):
+- Target is #![no_std] Rust edition 2024 (use aidoku::alloc::{...}; import aidoku::alloc::string::ToString when calling .to_string()).
+- aidoku::AidokuError derives Debug ONLY and does NOT implement Display or ToString! Always format it with \`format!("{e:?}")\`, NEVER \`e.to_string()\`.
+- aidoku::imports::js::JsContext::new() and ctx.eval(&str) ARE available on Aidoku 0.8.4.
+- If minAppVersion < 0.9.0: NEVER combine DynamicSettings with LoginSetting / "type":"login" (Postcard ABI breaks Settings on Aidoku 0.8.4), and NEVER call 0.9.0-only WebView methods (eval_async, add_user_script, set_rule_list, get_cookies, delete_cookie, delete_all_cookies); use WebView::new(), load(), and eval() polling.
+- Never alter res/source.json (the sync script bumps version and syncs URLs separately).
 
-Task:
-Determine whether the Mihon diff changes runtime behavior (API endpoints, CSS selectors, auth/headers, descrambling/crypto, URL structures, filters, embedded JS assets) that is NOT already handled cleanly by the current crate.
-- If the diff is only Kotlin refactoring, build.gradle tweaks already covered, or irrelevant Android UI boilerplate, respond with:
-  { "needsUpdate": false, "summary": "brief reason", "files": {} }
-- Otherwise, respond with ONLY valid JSON containing the complete updated file contents for ONLY the files in src/, res/, or assets/ that need changes (never include res/source.json):
-  { "needsUpdate": true, "summary": "what changed", "files": { "src/lib.rs": "full updated file content" } }`;
+Porting policy:
+- Preserve existing working crate features (mirror switcher, settings, custom descramblers, WebView fallback) while integrating upstream API endpoints, request signing, decryption, headers, filters, and fallback hosts.
+- Do NOT skip meaningful upstream improvements or API rewrites just because a WebView fallback already exists.
+- Return \`{ "needsUpdate": false, "summary": "brief reason", "files": {} }\` ONLY if the Mihon changes are strictly Android UI/Gradle boilerplate or already fully implemented with equivalent functionality in the current crate.
+- Otherwise return ONLY valid JSON containing complete updated file contents for ONLY the files in src/, res/, or assets/ that need adding or updating (never include res/source.json), plus optional \`deleteFiles\` for obsolete files:
+  { "needsUpdate": true, "summary": "what changed", "files": { "src/lib.rs": "full updated file content" }, "deleteFiles": [] }`;
 
-	const models = process.env.GEMINI_MODEL
-		? [process.env.GEMINI_MODEL]
-		: ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"];
-
-	let resp = null;
-	let lastErr = null;
-	for (const model of models) {
-		const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-		for (let retry = 0; retry < 3; retry++) {
-			const attempt = await fetch(endpoint, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					contents: [{ role: "user", parts: [{ text: prompt }] }],
-					generationConfig: {
-						temperature: 0.1,
-						responseMimeType: "application/json",
-					},
-				}),
-			});
-
-			if (attempt.ok) {
-				resp = attempt;
-				break;
-			}
-			const errText = await attempt.text();
-			lastErr = `gemini-http-${attempt.status} (${model}): ${errText.slice(0, 200)}`;
-			if (attempt.status === 503 && retry < 2) {
-				await new Promise((r) => setTimeout(r, 4000));
-				continue;
-			}
-			if (attempt.status !== 404 && attempt.status !== 429 && attempt.status !== 503) {
-				return { applied: false, reason: lastErr };
-			}
-			break;
-		}
-		if (resp) break;
-	}
-
-	if (!resp) {
-		return { applied: false, reason: lastErr || "gemini-no-available-model" };
-	}
-
-	const data = await resp.json();
-	const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-	if (!rawText) {
-		return { applied: false, reason: "empty-gemini-response" };
-	}
-
-	let parsed;
-	try {
-		parsed = JSON.parse(rawText);
-	} catch {
-		return { applied: false, reason: "invalid-gemini-json" };
-	}
-
-	if (!parsed?.needsUpdate || !parsed.files || typeof parsed.files !== "object") {
-		return { applied: false, reason: parsed?.summary || "no-rust-changes-needed" };
-	}
-
+	const contents = [{ role: "user", parts: [{ text: prompt }] }];
 	const backups = new Map();
-	let wroteAny = false;
+	let pinnedModel = null;
+	let finalSummary = "Gemini auto-ported changes";
+
 	try {
-		for (const [relPath, newContent] of Object.entries(parsed.files)) {
-			if (typeof newContent !== "string") continue;
-			if (!relPath.startsWith("src/") && !relPath.startsWith("res/") && !relPath.startsWith("assets/")) {
+		for (let attempt = 0; attempt < MAX_COMPILE_ATTEMPTS; attempt++) {
+			const res = await callGemini(apiKey, contents, pinnedModel);
+			if (!res.ok) {
+				restoreBackups(backups);
+				return { applied: false, reason: res.reason };
+			}
+			pinnedModel = res.model;
+
+			let parsed;
+			try {
+				parsed = parseGeminiJson(res.rawText);
+			} catch {
+				restoreBackups(backups);
+				return { applied: false, reason: "invalid-gemini-json" };
+			}
+
+			if (attempt === 0 && !parsed?.needsUpdate) {
+				return { applied: false, reason: parsed?.summary || "no-rust-changes-needed" };
+			}
+
+			if (parsed?.summary) {
+				finalSummary = String(parsed.summary);
+			}
+
+			let touchedThisTurn = false;
+			if (parsed?.files && typeof parsed.files === "object") {
+				for (const [rawRel, newContent] of Object.entries(parsed.files)) {
+					if (typeof newContent !== "string") continue;
+					const resolved = resolveSafeCrateRelPath(crateDir, rawRel);
+					if (!resolved) continue;
+					if (!backups.has(resolved.abs)) {
+						backups.set(
+							resolved.abs,
+							fs.existsSync(resolved.abs) ? fs.readFileSync(resolved.abs, "utf8") : null
+						);
+					}
+					fs.mkdirSync(path.dirname(resolved.abs), { recursive: true });
+					fs.writeFileSync(resolved.abs, newContent, "utf8");
+					touchedThisTurn = true;
+				}
+			}
+
+			if (Array.isArray(parsed?.deleteFiles)) {
+				for (const rawRel of parsed.deleteFiles) {
+					const resolved = resolveSafeCrateRelPath(crateDir, rawRel);
+					if (!resolved || !fs.existsSync(resolved.abs)) continue;
+					if (!backups.has(resolved.abs)) {
+						backups.set(resolved.abs, fs.readFileSync(resolved.abs, "utf8"));
+					}
+					fs.rmSync(resolved.abs, { force: true });
+					touchedThisTurn = true;
+				}
+			}
+
+			if (backups.size === 0 || (attempt > 0 && !touchedThisTurn)) {
+				restoreBackups(backups);
+				return { applied: false, reason: "no-applicable-files" };
+			}
+
+			const checkErrors = [];
+			const compat = checkAidoku084Compat(entry, crateDir);
+			if (!compat.ok) {
+				checkErrors.push(...compat.errors);
+			}
+
+			try {
+				execFileSync("cargo", ["check", "--target", "wasm32-unknown-unknown"], {
+					cwd: crateDir,
+					encoding: "utf8",
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+			} catch (compileErr) {
+				if (compileErr?.code !== "ENOENT") {
+					const stderr = String(compileErr.stderr || compileErr.message || "");
+					checkErrors.push(stderr);
+				}
+			}
+
+			if (checkErrors.length === 0) {
+				return { applied: true, summary: `${finalSummary} [${pinnedModel}]` };
+			}
+
+			const errorText = checkErrors.join("\n\n").slice(0, MAX_ERROR_CHARS);
+			console.log(
+				`  [ai] ${entry.id}: attempt ${attempt + 1}/${MAX_COMPILE_ATTEMPTS} failed check (${pinnedModel}); ` +
+					(attempt + 1 < MAX_COMPILE_ATTEMPTS ? "requesting fix..." : "rolling back.")
+			);
+
+			if (attempt + 1 < MAX_COMPILE_ATTEMPTS) {
+				contents.push({ role: "model", parts: [{ text: res.rawText }] });
+				contents.push({
+					role: "user",
+					parts: [
+						{
+							text:
+								`Your previous output failed verification/compilation:\n\`\`\`\n${errorText}\n\`\`\`\n` +
+								`Fix ALL errors above and return ONLY valid JSON in the exact format \`{ "needsUpdate": true, "summary": "...", "files": { "src/...": "complete fixed file content" } }\` containing ONLY the modified/added files.`,
+						},
+					],
+				});
 				continue;
 			}
-			if (relPath === "res/source.json") continue;
-			const abs = path.join(crateDir, relPath);
-			backups.set(abs, fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : null);
-			fs.mkdirSync(path.dirname(abs), { recursive: true });
-			fs.writeFileSync(abs, newContent, "utf8");
-			wroteAny = true;
+
+			restoreBackups(backups);
+			return {
+				applied: false,
+				reason: `compile-check-failed: ${errorText.slice(0, 300)}`,
+			};
 		}
 
-		if (!wroteAny) {
-			return { applied: false, reason: "no-applicable-files" };
-		}
-
-		try {
-			execFileSync("cargo", ["check", "--target", "wasm32-unknown-unknown"], {
-				cwd: crateDir,
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "pipe"],
-			});
-		} catch (compileErr) {
-			if (compileErr?.code !== "ENOENT") {
-				for (const [abs, prev] of backups.entries()) {
-					if (prev === null) fs.rmSync(abs, { force: true });
-					else fs.writeFileSync(abs, prev, "utf8");
-				}
-				return {
-					applied: false,
-					reason: `compile-check-failed: ${String(compileErr.stderr || compileErr.message).slice(0, 300)}`,
-				};
-			}
-		}
-
-		return { applied: true, summary: parsed.summary || "Gemini auto-ported changes" };
+		restoreBackups(backups);
+		return { applied: false, reason: "compile-check-failed: exceeded attempts" };
 	} catch (err) {
-		for (const [abs, prev] of backups.entries()) {
-			if (prev === null) fs.rmSync(abs, { force: true });
-			else fs.writeFileSync(abs, prev, "utf8");
-		}
+		restoreBackups(backups);
 		return { applied: false, reason: err.message };
 	}
 }
@@ -374,13 +662,29 @@ function bumpCrateVersion(crateDir, entry) {
 	return nextVersion;
 }
 
+function writeStepSummary(lines, initCommits) {
+	const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+	if (!summaryPath) return;
+	const items =
+		lines.length > 0
+			? lines.map((line) => `- ${line}`)
+			: [initCommits ? "- Initialized upstream commit SHAs." : "- All watched extensions are up to date."];
+	const md = `## Upstream Sync Summary\n\n${items.join("\n")}\n\n`;
+	fs.appendFileSync(summaryPath, md, "utf8");
+}
+
 async function main() {
 	const args = process.argv.slice(2);
 	const initCommits = args.includes("--init-commits");
 	const dryRun = args.includes("--dry-run");
 	const includeAll = args.includes("--all");
+	const force = args.includes("--force");
 	const idIdx = args.indexOf("--id");
-	const targetId = idIdx !== -1 ? args[idIdx + 1] : null;
+	const targetId = idIdx !== -1 ? args[idIdx + 1]?.trim() || null : null;
+
+	if (force && !targetId) {
+		throw new Error("--force requires --id <extension-id> to avoid burning API quota on all extensions.");
+	}
 
 	if (!fs.existsSync(EXTENSIONS_FILE)) {
 		throw new Error("extensions.json not found");
@@ -401,6 +705,7 @@ async function main() {
 
 	console.log(
 		`Checking ${watchedSources.length} of ${registry.sources.length} extension(s)` +
+			(force ? " [force]" : "") +
 			(dryRun ? " [dry-run]" : "") +
 			"..."
 	);
@@ -470,7 +775,7 @@ async function main() {
 			entry.mihonPath
 		);
 
-		if (changedFiles.length === 0) {
+		if (changedFiles.length === 0 && !force) {
 			if (latestMihon && entry.lastMihonCommit !== latestMihon) {
 				entry.lastMihonCommit = latestMihon;
 				registryDirty = true;
@@ -482,12 +787,21 @@ async function main() {
 			continue;
 		}
 
-		console.log(`[update] ${entry.id}: Mihon changed ${changedFiles.length} file(s)`);
+		if (changedFiles.length > 0) {
+			console.log(`[update] ${entry.id}: Mihon changed ${changedFiles.length} file(s)`);
+		} else {
+			console.log(`[force] ${entry.id}: Running forced AI sync against Mihon HEAD (${latestMihon?.slice(0, 7)})`);
+		}
+
 		const mihonDir = path.join(keiyoushiRepo, entry.mihonPath);
 		const info = parseMihonExtension(mihonDir, entry.mihonPath);
 
 		if (dryRun) {
-			summaryLines.push(`${entry.id}: would sync ${changedFiles.join(", ")}`);
+			summaryLines.push(
+				changedFiles.length > 0
+					? `${entry.id}: would sync ${changedFiles.join(", ")}`
+					: `${entry.id}: would force-sync full Mihon sources (${latestMihon?.slice(0, 7)})`
+			);
 			continue;
 		}
 
@@ -497,12 +811,19 @@ async function main() {
 
 		let aiResult = { applied: false, reason: "no-kt-or-js-diff" };
 		const hasCodeChange = changedFiles.some((f) => f.endsWith(".kt") || f.endsWith(".js"));
-		if (hasCodeChange) {
-			const diffText = runGit(
-				["diff", entry.lastMihonCommit, latestMihon, "--", entry.mihonPath],
-				keiyoushiRepo
-			);
-			aiResult = await applyGeminiPort(entry, crateDir, diffText);
+		if (hasCodeChange || force) {
+			let diffText = "";
+			if (entry.lastMihonCommit && latestMihon && entry.lastMihonCommit !== latestMihon) {
+				try {
+					diffText = runGit(
+						["diff", entry.lastMihonCommit, latestMihon, "--", entry.mihonPath],
+						keiyoushiRepo
+					);
+				} catch {
+					diffText = "";
+				}
+			}
+			aiResult = await applyGeminiPort(entry, crateDir, mihonDir, diffText, force);
 			console.log(`  [ai] ${entry.id}: applied=${aiResult.applied} (${aiResult.summary || aiResult.reason})`);
 		}
 
@@ -517,11 +838,13 @@ async function main() {
 			);
 		}
 
-		const isTransientAiError =
+		const holdCommit =
 			!aiResult.applied &&
-			/^(gemini-http-|empty-gemini-response|invalid-gemini-json)/.test(aiResult.reason || "");
+			/^(gemini-http-|empty-gemini-response|invalid-gemini-json|compile-check-failed)/.test(
+				aiResult.reason || ""
+			);
 
-		if (!isTransientAiError) {
+		if (!holdCommit) {
 			entry.lastMihonCommit = latestMihon;
 			if (latestAidoku) entry.lastAidokuCommit = latestAidoku;
 			registryDirty = true;
@@ -538,6 +861,8 @@ async function main() {
 	} else {
 		console.log(initCommits ? "Initialized upstream commit SHAs." : "All watched extensions are up to date.");
 	}
+
+	writeStepSummary(summaryLines, initCommits);
 }
 
 main().catch((err) => {

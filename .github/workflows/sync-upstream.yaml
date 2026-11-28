@@ -4,6 +4,27 @@ on:
   schedule:
     - cron: "0 */12 * * *"
   workflow_dispatch:
+    inputs:
+      id:
+        description: "Optional single extension ID to sync (e.g. en.comix)"
+        required: false
+        type: string
+        default: ""
+      force:
+        description: "Force AI port even if no new Mihon diff (requires id)"
+        required: false
+        type: boolean
+        default: false
+      model:
+        description: "Optional Gemini model override (e.g. gemini-3.1-pro-preview)"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Check for upstream updates without modifying files"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}
@@ -44,17 +65,32 @@ jobs:
       - name: Sync upstream Mihon & Aidoku changes
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: node scripts/sync-upstream.mjs
+          GEMINI_MODEL: ${{ inputs.model || vars.GEMINI_MODEL }}
+          INPUT_ID: ${{ inputs.id }}
+          INPUT_FORCE: ${{ inputs.force }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          args=()
+          if [[ -n "$INPUT_ID" ]]; then
+            args+=(--id "$INPUT_ID")
+          fi
+          if [[ "$INPUT_FORCE" == "true" ]]; then
+            args+=(--force)
+          fi
+          if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          node scripts/sync-upstream.mjs "${args[@]}"
 
       - name: Detect source or registry changes
         id: changes
         run: |
-          if [[ -n "$(git status --porcelain sources/)" ]]; then
+          if [[ -n "$(git status --porcelain -- 'sources/*/src' 'sources/*/res' 'sources/*/assets' 'sources/*/Cargo.toml')" ]]; then
             echo "sources_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "sources_changed=false" >> "$GITHUB_OUTPUT"
           fi
-          if [[ -n "$(git status --porcelain sources/ extensions.json)" ]]; then
+          if [[ -n "$(git status --porcelain -- sources/ extensions.json)" ]]; then
             echo "any_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "any_changed=false" >> "$GITHUB_OUTPUT"
@@ -83,6 +119,7 @@ jobs:
           aidoku build sources/*/package.aix --name "Mlyn Aidoku Sources"
           touch public/.nojekyll
           node scripts/build-repo.mjs
+          node scripts/build-repo.mjs --verify
 
       - name: Deploy to GitHub Pages
         if: steps.changes.outputs.sources_changed == 'true'
