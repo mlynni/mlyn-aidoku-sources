@@ -85,7 +85,8 @@ jobs:
       - name: Detect source or registry changes
         id: changes
         run: |
-          if [[ -n "$(git status --porcelain -- 'sources/*/src' 'sources/*/res' 'sources/*/assets' 'sources/*/Cargo.toml')" ]]; then
+          changed_sources="$(git status --porcelain -uall -- sources/ | grep -v '/MIHON_SOURCE\.md$' || true)"
+          if [[ -n "$changed_sources" ]]; then
             echo "sources_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "sources_changed=false" >> "$GITHUB_OUTPUT"
