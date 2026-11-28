@@ -418,17 +418,17 @@
 			"name": "Mangago",
 			"mihonPath": "src/en/mangago",
 			"aidokuPath": "sources/en.mangago",
-			"version": 4,
+			"version": 5,
 			"languages": [
 				"en"
 			],
 			"contentRating": 2,
 			"baseURL": "https://www.mangago.me",
 			"minAppVersion": "0.7.1",
-			"packageFile": "en.mangago-v4.aix",
-			"iconFile": "en.mangago-v4.png",
+			"packageFile": "en.mangago-v5.aix",
+			"iconFile": "en.mangago-v5.png",
 			"status": "ready",
-			"lastMihonCommit": "92906c0382547f30a03b3176f2f2429be6b54dce",
+			"lastMihonCommit": "687424758730ed9a976e3634e492f4cc4cef51e2",
 			"lastAidokuCommit": "2b0996dcdaf4529b36e059882f8bf50d33d87bb5",
 			"autoSync": true
 		},

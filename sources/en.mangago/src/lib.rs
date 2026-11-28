@@ -105,7 +105,7 @@ impl Source for Mangago {
 					let link_el = el.select_first(".thm-effect")?;
 					let url = link_el.attr("abs:href")?;
 					let key = url.strip_prefix(BASE_URL)?.into();
-					let title = link_el.attr("title").unwrap_or_default();
+					let title = link_el.attr("title").filter(|s| !s.trim().is_empty())?;
 					let cover = link_el
 						.select_first("img")
 						.and_then(|el| el.attr("abs:data-src").or_else(|| el.attr("abs:src")));
@@ -150,7 +150,8 @@ impl Source for Mangago {
 				.and_then(|el| el.attr("abs:src"));
 			manga.description = info_el
 				.select_first(".manga_summary")
-				.and_then(|el| el.text());
+				.and_then(|el| el.text())
+				.filter(|s| !s.eq_ignore_ascii_case("not found..."));
 
 			for el in info_el
 				.select(".manga_info li, .manga_right tr")
@@ -171,7 +172,7 @@ impl Source for Mangago {
 							})
 							.unwrap_or_default();
 					}
-					"author(s):" | "author" => {
+					"author(s):" | "author:" => {
 						manga.authors = el
 							.select("a")
 							.map(|els| els.filter_map(|el| el.text()).collect());
@@ -401,7 +402,12 @@ impl PageImageProcessor for Mangago {
 
 impl DeepLinkHandler for Mangago {
 	fn handle_deep_link(&self, url: String) -> Result<Option<DeepLinkResult>> {
-		let Some(path) = url.strip_prefix(BASE_URL) else {
+		let Some(path) = url
+			.strip_prefix("https://www.mangago.me")
+			.or_else(|| url.strip_prefix("https://mangago.me"))
+			.or_else(|| url.strip_prefix("http://www.mangago.me"))
+			.or_else(|| url.strip_prefix("http://mangago.me"))
+		else {
 			return Ok(None);
 		};
 
