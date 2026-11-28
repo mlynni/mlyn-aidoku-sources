@@ -248,23 +248,39 @@ Determine whether the Mihon diff changes runtime behavior (API endpoints, CSS se
 - Otherwise, respond with ONLY valid JSON containing the complete updated file contents for ONLY the files in src/, res/, or assets/ that need changes (never include res/source.json):
   { "needsUpdate": true, "summary": "what changed", "files": { "src/lib.rs": "full updated file content" } }`;
 
-	const model = process.env.GEMINI_MODEL || "gemini-3.1-pro-preview";
-	const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-	const resp = await fetch(endpoint, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({
-			contents: [{ role: "user", parts: [{ text: prompt }] }],
-			generationConfig: {
-				temperature: 0.1,
-				responseMimeType: "application/json",
-			},
-		}),
-	});
+	const models = process.env.GEMINI_MODEL
+		? [process.env.GEMINI_MODEL]
+		: ["gemini-2.5-flash", "gemini-3-flash-preview", "gemini-3.1-pro-preview"];
 
-	if (!resp.ok) {
-		const errText = await resp.text();
-		return { applied: false, reason: `gemini-http-${resp.status}: ${errText.slice(0, 200)}` };
+	let resp = null;
+	let lastErr = null;
+	for (const model of models) {
+		const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+		const attempt = await fetch(endpoint, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				contents: [{ role: "user", parts: [{ text: prompt }] }],
+				generationConfig: {
+					temperature: 0.1,
+					responseMimeType: "application/json",
+				},
+			}),
+		});
+
+		if (attempt.ok) {
+			resp = attempt;
+			break;
+		}
+		const errText = await attempt.text();
+		lastErr = `gemini-http-${attempt.status} (${model}): ${errText.slice(0, 200)}`;
+		if (attempt.status !== 404 && attempt.status !== 429) {
+			return { applied: false, reason: lastErr };
+		}
+	}
+
+	if (!resp) {
+		return { applied: false, reason: lastErr || "gemini-no-available-model" };
 	}
 
 	const data = await resp.json();
