@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+		<meta
+			name="description"
+			content="Mlyn Aidoku Sources — curated personal Aidoku source repository (17 sources ported from Mihon & Aidoku: Atsumaru, Comix, Kagane, MANGA Plus, Mangaball, MangaBat, MangaDex, MangaDotNet, MangaFire, Mangago, MangaKakalot, MangaNato, MangaNelo, MangaPill, Toonily, Weeb Central)."
+		/>
+		<title>Mlyn Aidoku Sources</title>
+		<meta property="og:title" content="Mlyn Aidoku Sources" />
+		<meta
+			property="og:description"
+			content="Curated personal Aidoku source repository (17 sources ported from Mihon & Aidoku)."
+		/>
+		<link rel="stylesheet" href="styles.css" />
+	</head>
+	<body>
+		<header>
+			<h1 class="main-heading">Mlyn Aidoku Sources</h1>
+			<p class="main-description">
+				Curated personal Aidoku source list focused strictly on the 17 extensions I actively read
+				(Atsumaru, Comix, Kagane, MANGA Plus, Mangaball, MangaBat, MangaDex, MangaDotNet, MangaFire,
+				Mangago, MangaKakalot, MangaNato, MangaNelo, MangaPill, Toonily, Weeb Central), ported from
+				Mihon (<code>keiyoushi/extensions-source</code>) and Aidoku upstream with automatic upstream sync.
+			</p>
+		</header>
+		<main>
+			<div id="add-repo-btn" style="display: none">
+				<button id="add-repo-action">Add Sources to Aidoku</button>
+				<p>Requires <b>Aidoku 0.7</b> or newer (<b>0.8.4+</b> for Comix / MangaDotNet v20, <b>0.9.0+</b> for Mangadotnet v10).</p>
+			</div>
+			<div id="non-apple-note">
+				<p>
+					You can add this repository inside the Aidoku app in the
+					<b>Settings</b> tab under <b>Source Lists</b> by entering:
+					<code id="source-list-url">index.min.json</code>
+				</p>
+			</div>
+			<div id="filter-container">
+				<div class="filter-group">
+					<label for="source-search" class="filter-label">
+						Search
+					</label>
+					<input
+						type="text"
+						id="source-search"
+						placeholder="Search sources..."
+						autocomplete="off"
+					/>
+				</div>
+				<div id="filter-menus-row">
+					<div class="filter-group">
+						<label for="language-select" class="filter-label">
+							Language
+						</label>
+						<div class="select-wrapper">
+							<select id="language-select">
+								<option value="">All Languages</option>
+							</select>
+							<svg
+								class="select-chevron"
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 1024 1024"
+								width="18"
+								height="18"
+							>
+								<path
+									fill="currentColor"
+									d="M831.872 340.864 512 652.672 192.128 340.864a30.592 30.592 0 0 0-42.752 0 29.12 29.12 0 0 0 0 41.6L489.664 714.24a32 32 0 0 0 44.672 0l340.288-331.712a29.12 29.12 0 0 0 0-41.728 30.592 30.592 0 0 0-42.752 0z"
+								></path>
+							</svg>
+						</div>
+					</div>
+					<div class="filter-group">
+						<label for="rating-select" class="filter-label">
+							Content Rating
+						</label>
+						<div class="select-wrapper">
+							<select id="rating-select">
+								<option value="">All Content Ratings</option>
+								<option value="safe">Safe</option>
+								<option value="contains-nsfw">
+									Contains NSFW
+								</option>
+								<option value="nsfw">NSFW</option>
+							</select>
+							<svg
+								class="select-chevron"
+								xmlns="http://www.w3.org/2000/svg"
+								viewBox="0 0 1024 1024"
+								width="18"
+								height="18"
+							>
+								<path
+									fill="currentColor"
+									d="M831.872 340.864 512 652.672 192.128 340.864a30.592 30.592 0 0 0-42.752 0 29.12 29.12 0 0 0 0 41.6L489.664 714.24a32 32 0 0 0 44.672 0l340.288-331.712a29.12 29.12 0 0 0 0-41.728 30.592 30.592 0 0 0-42.752 0z"
+								></path>
+							</svg>
+						</div>
+					</div>
+				</div>
+			</div>
+			<noscript>
+				You need to enable JavaScript to see and filter sources.
+			</noscript>
+			<div class="source-list-header-row">
+				<span class="total-count" id="total-count"></span>
+			</div>
+			<div id="source-list"></div>
+		</main>
+		<script>
+			(function () {
+				const indexUrl = new URL("index.min.json", window.location.href).href;
+				const urlEl = document.getElementById("source-list-url");
+				if (urlEl) urlEl.textContent = indexUrl;
+
+				const actionBtn = document.getElementById("add-repo-action");
+				if (actionBtn) {
+					actionBtn.addEventListener("click", () => {
+						window.location =
+							"aidoku://addSourceList?url=" +
+							encodeURIComponent(indexUrl);
+					});
+				}
+
+				const ua = navigator.userAgent.toLowerCase();
+				const isApple = /iphone|ipad|ipados|macintosh|mac os x/.test(ua);
+				const btn = document.getElementById("add-repo-btn");
+				if (btn && isApple) btn.style.display = "";
+			})();
+		</script>
+		<script src="main.js" defer></script>
+	</body>
+</html>
